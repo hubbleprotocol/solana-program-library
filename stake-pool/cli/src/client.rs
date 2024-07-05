@@ -20,11 +20,12 @@ type Error = Box<dyn std::error::Error>;
 pub fn get_stake_pool(
     rpc_client: &RpcClient,
     stake_pool_address: &Pubkey,
-) -> Result<StakePool, Error> {
-    let account_data = rpc_client.get_account_data(stake_pool_address)?;
+) -> Result<(Pubkey, StakePool), Error> {
+    let account = rpc_client.get_account(stake_pool_address)?;
+    let account_data = account.data;
     let stake_pool = try_from_slice_unchecked::<StakePool>(account_data.as_slice())
         .map_err(|err| format!("Invalid stake pool {}: {}", stake_pool_address, err))?;
-    Ok(stake_pool)
+    Ok((account.owner, stake_pool))
 }
 
 pub fn get_validator_list(

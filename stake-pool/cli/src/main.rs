@@ -2,6 +2,10 @@
 mod client;
 mod output;
 
+use std::{io::Write, thread::sleep, time::Duration};
+
+use solana_client::{rpc_client::SerializableTransaction, rpc_config::RpcSendTransactionConfig};
+use solana_sdk::compute_budget::ComputeBudgetInstruction;
 // use instruction::create_associated_token_account once ATA 1.0.5 is released
 #[allow(deprecated)]
 use spl_associated_token_account::create_associated_token_account;
@@ -143,7 +147,7 @@ fn get_signer(
 
 fn get_latest_blockhash(client: &RpcClient) -> Result<Hash, Error> {
     Ok(client
-        .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())?
+        .get_latest_blockhash_with_commitment(CommitmentConfig::finalized())?
         .0)
 }
 
@@ -153,9 +157,24 @@ fn send_transaction_no_wait(
 ) -> solana_client::client_error::Result<()> {
     if config.dry_run {
         let result = config.rpc_client.simulate_transaction(&transaction)?;
-        println!("Simulate result: {:?}", result);
+        println!("Simulate result: {:#?}", result);
     } else {
-        let signature = config.rpc_client.send_transaction(&transaction)?;
+        let result = config.rpc_client.simulate_transaction(&transaction)?;
+        println!("Simulate result: {:#?}", result.value);
+        if result.value.err.is_some() {
+            return Err(result.value.err.unwrap().into());
+        }
+        let signature = config.rpc_client.send_transaction_with_config(
+            &transaction,
+            RpcSendTransactionConfig {
+                skip_preflight: true,
+                preflight_commitment: Some(
+                    solana_sdk::commitment_config::CommitmentLevel::Finalized,
+                ),
+                max_retries: Some(0),
+                ..Default::default()
+            },
+        )?;
         println!("Signature: {}", signature);
     }
     Ok(())
@@ -167,12 +186,45 @@ fn send_transaction(
 ) -> solana_client::client_error::Result<()> {
     if config.dry_run {
         let result = config.rpc_client.simulate_transaction(&transaction)?;
-        println!("Simulate result: {:?}", result);
+        println!("Simulate result: {:#?}", result);
     } else {
-        let signature = config
-            .rpc_client
-            .send_and_confirm_transaction_with_spinner(&transaction)?;
-        println!("Signature: {}", signature);
+        let result = config.rpc_client.simulate_transaction(&transaction)?;
+        println!("Simulate result: {:#?}", result.value);
+        if result.value.err.is_some() {
+            return Err(result.value.err.unwrap().into());
+        }
+        println!("Attempt signature: {}", transaction.get_signature());
+        let mut attempt_nb = 0;
+        loop {
+            attempt_nb += 1;
+            print!("\rAttempt {attempt_nb}...");
+            let _ = std::io::stdout().flush();
+
+            if !config.rpc_client.is_blockhash_valid(
+                transaction.get_recent_blockhash(),
+                CommitmentConfig::processed(),
+            )? {
+                println!("Blockhash is expired...");
+                break;
+            }
+            let signature = config.rpc_client.send_transaction_with_config(
+                &transaction,
+                RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    max_retries: Some(0),
+                    ..Default::default()
+                },
+            )?;
+
+            sleep(Duration::from_millis(600));
+            let status = config
+                .rpc_client
+                .confirm_transaction_with_commitment(&signature, CommitmentConfig::processed())?;
+            if status.value {
+                println!("Transaction confirmed");
+                break;
+            }
+        }
     }
     Ok(())
 }
@@ -182,12 +234,16 @@ fn checked_transaction_with_signers<T: Signers>(
     instructions: &[Instruction],
     signers: &T,
 ) -> Result<Transaction, Error> {
+    let cu_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(200_000);
+    let cu_priority_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(10000);
+    let ixs: Vec<_> = [cu_budget_ix, cu_priority_fee_ix]
+        .iter()
+        .chain(instructions.iter())
+        .cloned()
+        .collect();
     let recent_blockhash = get_latest_blockhash(&config.rpc_client)?;
-    let message = Message::new_with_blockhash(
-        instructions,
-        Some(&config.fee_payer.pubkey()),
-        &recent_blockhash,
-    );
+    let message =
+        Message::new_with_blockhash(&ixs, Some(&config.fee_payer.pubkey()), &recent_blockhash);
     check_fee_payer_balance(config, config.rpc_client.get_fee_for_message(&message)?)?;
     let transaction = Transaction::new(signers, message, recent_blockhash);
     Ok(transaction)
@@ -419,7 +475,7 @@ fn command_vsa_add(
     stake_pool_address: &Pubkey,
     vote_account: &Pubkey,
 ) -> CommandResult {
-    let stake_pool = get_stake_pool(&config.rpc_client, stake_pool_address)?;
+    let (program_id, stake_pool) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
     let validator_list = get_validator_list(&config.rpc_client, &stake_pool.validator_list)?;
     if validator_list.contains(vote_account) {
         println!(
@@ -438,12 +494,8 @@ fn command_vsa_add(
         let mut i = 0;
         loop {
             let seed = NonZeroU32::new(i);
-            let (address, _) = find_stake_program_address(
-                &spl_stake_pool::id(),
-                vote_account,
-                stake_pool_address,
-                seed,
-            );
+            let (address, _) =
+                find_stake_program_address(&program_id, vote_account, stake_pool_address, seed);
             let maybe_account = config
                 .rpc_client
                 .get_account_with_commitment(
@@ -468,7 +520,7 @@ fn command_vsa_add(
         config,
         &[
             spl_stake_pool::instruction::add_validator_to_pool_with_vote(
-                &spl_stake_pool::id(),
+                &program_id,
                 &stake_pool,
                 stake_pool_address,
                 vote_account,
@@ -491,7 +543,7 @@ fn command_vsa_remove(
         command_update(config, stake_pool_address, false, false, false)?;
     }
 
-    let stake_pool = get_stake_pool(&config.rpc_client, stake_pool_address)?;
+    let (program_id, stake_pool) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
     let validator_list = get_validator_list(&config.rpc_client, &stake_pool.validator_list)?;
     let validator_stake_info = validator_list
         .find(vote_account)
@@ -499,7 +551,7 @@ fn command_vsa_remove(
 
     let validator_seed = NonZeroU32::new(validator_stake_info.validator_seed_suffix.into());
     let (stake_account_address, _) = find_stake_program_address(
-        &spl_stake_pool::id(),
+        &program_id,
         vote_account,
         stake_pool_address,
         validator_seed,
@@ -513,7 +565,7 @@ fn command_vsa_remove(
     let instructions = vec![
         // Create new validator stake account address
         spl_stake_pool::instruction::remove_validator_from_pool_with_vote(
-            &spl_stake_pool::id(),
+            &program_id,
             &stake_pool,
             stake_pool_address,
             vote_account,
@@ -538,7 +590,7 @@ fn command_increase_validator_stake(
         command_update(config, stake_pool_address, false, false, false)?;
     }
 
-    let stake_pool = get_stake_pool(&config.rpc_client, stake_pool_address)?;
+    let (program_id, stake_pool) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
     let validator_list = get_validator_list(&config.rpc_client, &stake_pool.validator_list)?;
     let validator_stake_info = validator_list
         .find(vote_account)
@@ -551,7 +603,7 @@ fn command_increase_validator_stake(
         config,
         &[
             spl_stake_pool::instruction::increase_validator_stake_with_vote(
-                &spl_stake_pool::id(),
+                &program_id,
                 &stake_pool,
                 stake_pool_address,
                 vote_account,
@@ -577,7 +629,7 @@ fn command_decrease_validator_stake(
         command_update(config, stake_pool_address, false, false, false)?;
     }
 
-    let stake_pool = get_stake_pool(&config.rpc_client, stake_pool_address)?;
+    let (program_id, stake_pool) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
     let validator_list = get_validator_list(&config.rpc_client, &stake_pool.validator_list)?;
     let validator_stake_info = validator_list
         .find(vote_account)
@@ -590,7 +642,7 @@ fn command_decrease_validator_stake(
         config,
         &[
             spl_stake_pool::instruction::decrease_validator_stake_with_vote(
-                &spl_stake_pool::id(),
+                &program_id,
                 &stake_pool,
                 stake_pool_address,
                 vote_account,
@@ -611,13 +663,13 @@ fn command_set_preferred_validator(
     preferred_type: PreferredValidatorType,
     vote_address: Option<Pubkey>,
 ) -> CommandResult {
-    let stake_pool = get_stake_pool(&config.rpc_client, stake_pool_address)?;
+    let (program_id, stake_pool) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
     let mut signers = vec![config.fee_payer.as_ref(), config.staker.as_ref()];
     unique_signers!(signers);
     let transaction = checked_transaction_with_signers(
         config,
         &[spl_stake_pool::instruction::set_preferred_validator(
-            &spl_stake_pool::id(),
+            &program_id,
             stake_pool_address,
             &config.staker.pubkey(),
             &stake_pool.validator_list,
@@ -674,7 +726,7 @@ fn command_deposit_stake(
         command_update(config, stake_pool_address, false, false, false)?;
     }
 
-    let stake_pool = get_stake_pool(&config.rpc_client, stake_pool_address)?;
+    let (program_id, stake_pool) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
     let stake_state = get_stake_state(&config.rpc_client, stake)?;
 
     if config.verbose {
@@ -694,7 +746,7 @@ fn command_deposit_stake(
 
     // Calculate validator stake account address linked to the pool
     let (validator_stake_account, _) = find_stake_program_address(
-        &spl_stake_pool::id(),
+        &program_id,
         &vote_account,
         stake_pool_address,
         validator_seed,
@@ -727,7 +779,7 @@ fn command_deposit_stake(
     let referrer_token_account = referrer_token_account.unwrap_or(pool_token_receiver_account);
 
     let pool_withdraw_authority =
-        find_withdraw_authority_program_address(&spl_stake_pool::id(), stake_pool_address).0;
+        find_withdraw_authority_program_address(&program_id, stake_pool_address).0;
 
     let mut deposit_instructions =
         if let Some(stake_deposit_authority) = config.funding_authority.as_ref() {
@@ -742,7 +794,7 @@ fn command_deposit_stake(
             }
 
             spl_stake_pool::instruction::deposit_stake_with_authority(
-                &spl_stake_pool::id(),
+                &program_id,
                 stake_pool_address,
                 &stake_pool.validator_list,
                 &stake_deposit_authority.pubkey(),
@@ -759,7 +811,7 @@ fn command_deposit_stake(
             )
         } else {
             spl_stake_pool::instruction::deposit_stake(
-                &spl_stake_pool::id(),
+                &program_id,
                 stake_pool_address,
                 &stake_pool.validator_list,
                 &pool_withdraw_authority,
@@ -806,7 +858,7 @@ fn command_deposit_all_stake(
     }
 
     let stake_addresses = get_all_stake(&config.rpc_client, stake_authority)?;
-    let stake_pool = get_stake_pool(&config.rpc_client, stake_pool_address)?;
+    let (program_id, stake_pool) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
 
     // Create token account if not specified
     let mut total_rent_free_balances = 0;
@@ -837,7 +889,7 @@ fn command_deposit_all_stake(
     let referrer_token_account = referrer_token_account.unwrap_or(pool_token_receiver_account);
 
     let pool_withdraw_authority =
-        find_withdraw_authority_program_address(&spl_stake_pool::id(), stake_pool_address).0;
+        find_withdraw_authority_program_address(&program_id, stake_pool_address).0;
     let validator_list = get_validator_list(&config.rpc_client, &stake_pool.validator_list)?;
     let mut signers = if let Some(stake_deposit_authority) = config.funding_authority.as_ref() {
         if stake_deposit_authority.pubkey() != stake_pool.stake_deposit_authority {
@@ -874,7 +926,7 @@ fn command_deposit_all_stake(
 
         // Calculate validator stake account address linked to the pool
         let (validator_stake_account, _) = find_stake_program_address(
-            &spl_stake_pool::id(),
+            &program_id,
             &vote_account,
             stake_pool_address,
             validator_seed,
@@ -890,7 +942,7 @@ fn command_deposit_all_stake(
         let instructions = if let Some(stake_deposit_authority) = config.funding_authority.as_ref()
         {
             spl_stake_pool::instruction::deposit_stake_with_authority(
-                &spl_stake_pool::id(),
+                &program_id,
                 stake_pool_address,
                 &stake_pool.validator_list,
                 &stake_deposit_authority.pubkey(),
@@ -907,7 +959,7 @@ fn command_deposit_all_stake(
             )
         } else {
             spl_stake_pool::instruction::deposit_stake(
-                &spl_stake_pool::id(),
+                &program_id,
                 stake_pool_address,
                 &stake_pool.validator_list,
                 &pool_withdraw_authority,
@@ -964,7 +1016,7 @@ fn command_deposit_sol(
         .into());
     }
 
-    let stake_pool = get_stake_pool(&config.rpc_client, stake_pool_address)?;
+    let (program_id, stake_pool) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
 
     let mut instructions: Vec<Instruction> = vec![];
 
@@ -997,7 +1049,7 @@ fn command_deposit_sol(
     let referrer_token_account = referrer_token_account.unwrap_or(pool_token_receiver_account);
 
     let pool_withdraw_authority =
-        find_withdraw_authority_program_address(&spl_stake_pool::id(), stake_pool_address).0;
+        find_withdraw_authority_program_address(&program_id, stake_pool_address).0;
 
     let deposit_instruction = if let Some(deposit_authority) = config.funding_authority.as_ref() {
         let expected_sol_deposit_authority = stake_pool.sol_deposit_authority.ok_or_else(|| {
@@ -1014,7 +1066,7 @@ fn command_deposit_sol(
         }
 
         spl_stake_pool::instruction::deposit_sol_with_authority(
-            &spl_stake_pool::id(),
+            &program_id,
             stake_pool_address,
             &deposit_authority.pubkey(),
             &pool_withdraw_authority,
@@ -1029,7 +1081,7 @@ fn command_deposit_sol(
         )
     } else {
         spl_stake_pool::instruction::deposit_sol(
-            &spl_stake_pool::id(),
+            &program_id,
             stake_pool_address,
             &pool_withdraw_authority,
             &stake_pool.reserve_stake,
@@ -1062,7 +1114,7 @@ fn command_deposit_sol(
 }
 
 fn command_list(config: &Config, stake_pool_address: &Pubkey) -> CommandResult {
-    let stake_pool = get_stake_pool(&config.rpc_client, stake_pool_address)?;
+    let (program_id, stake_pool) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
     let reserve_stake_account_address = stake_pool.reserve_stake.to_string();
     let total_lamports = stake_pool.total_lamports;
     let last_update_epoch = stake_pool.last_update_epoch;
@@ -1072,7 +1124,7 @@ fn command_list(config: &Config, stake_pool_address: &Pubkey) -> CommandResult {
     let pool_mint = get_token_mint(&config.rpc_client, &stake_pool.pool_mint)?;
     let epoch_info = config.rpc_client.get_epoch_info()?;
     let pool_withdraw_authority =
-        find_withdraw_authority_program_address(&spl_stake_pool::id(), stake_pool_address).0;
+        find_withdraw_authority_program_address(&program_id, stake_pool_address).0;
     let reserve_stake = config.rpc_client.get_account(&stake_pool.reserve_stake)?;
     let minimum_reserve_stake_balance = config
         .rpc_client
@@ -1084,13 +1136,13 @@ fn command_list(config: &Config, stake_pool_address: &Pubkey) -> CommandResult {
         .map(|validator| {
             let validator_seed = NonZeroU32::new(validator.validator_seed_suffix.into());
             let (stake_account_address, _) = find_stake_program_address(
-                &spl_stake_pool::id(),
+                &program_id,
                 &validator.vote_account_address,
                 stake_pool_address,
                 validator_seed,
             );
             let (transient_stake_account_address, _) = find_transient_stake_program_address(
-                &spl_stake_pool::id(),
+                &program_id,
                 &validator.vote_account_address,
                 stake_pool_address,
                 validator.transient_seed_suffix.into(),
@@ -1145,7 +1197,7 @@ fn command_update(
         println!("Update requested, but --no-update flag specified, so doing nothing");
         return Ok(());
     }
-    let stake_pool = get_stake_pool(&config.rpc_client, stake_pool_address)?;
+    let (program_id, stake_pool) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
     let epoch_info = config.rpc_client.get_epoch_info()?;
 
     if stake_pool.last_update_epoch == epoch_info.epoch {
@@ -1161,7 +1213,7 @@ fn command_update(
 
     let (mut update_list_instructions, final_instructions) = if stale_only {
         spl_stake_pool::instruction::update_stale_stake_pool(
-            &spl_stake_pool::id(),
+            &program_id,
             &stake_pool,
             &validator_list,
             stake_pool_address,
@@ -1170,7 +1222,7 @@ fn command_update(
         )
     } else {
         spl_stake_pool::instruction::update_stake_pool(
-            &spl_stake_pool::id(),
+            &program_id,
             &stake_pool,
             &validator_list,
             stake_pool_address,
@@ -1182,10 +1234,10 @@ fn command_update(
     if update_list_instructions_len > 0 {
         let last_instruction = update_list_instructions.split_off(update_list_instructions_len - 1);
         // send the first ones without waiting
-        for instruction in update_list_instructions {
+        for instruction in update_list_instructions.chunks(2) {
             let transaction = checked_transaction_with_signers(
                 config,
-                &[instruction],
+                instruction,
                 &[config.fee_payer.as_ref()],
             )?;
             send_transaction_no_wait(config, transaction)?;
@@ -1245,6 +1297,7 @@ where
 
 fn prepare_withdraw_accounts(
     rpc_client: &RpcClient,
+    program_id: &Pubkey,
     stake_pool: &StakePool,
     pool_amount: u64,
     stake_pool_address: &Pubkey,
@@ -1266,7 +1319,7 @@ fn prepare_withdraw_accounts(
         |validator| {
             let validator_seed = NonZeroU32::new(validator.validator_seed_suffix.into());
             let (stake_account_address, _) = find_stake_program_address(
-                &spl_stake_pool::id(),
+                program_id,
                 &validator.vote_account_address,
                 stake_pool_address,
                 validator_seed,
@@ -1285,7 +1338,7 @@ fn prepare_withdraw_accounts(
         stake_pool,
         |validator| {
             let (transient_stake_account_address, _) = find_transient_stake_program_address(
-                &spl_stake_pool::id(),
+                program_id,
                 &validator.vote_account_address,
                 stake_pool_address,
                 validator.transient_seed_suffix.into(),
@@ -1374,12 +1427,12 @@ fn command_withdraw_stake(
         command_update(config, stake_pool_address, false, false, false)?;
     }
 
-    let stake_pool = get_stake_pool(&config.rpc_client, stake_pool_address)?;
+    let (program_id, stake_pool) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
     let pool_mint = get_token_mint(&config.rpc_client, &stake_pool.pool_mint)?;
     let pool_amount = spl_token::ui_amount_to_amount(pool_amount, pool_mint.decimals);
 
     let pool_withdraw_authority =
-        find_withdraw_authority_program_address(&spl_stake_pool::id(), stake_pool_address).0;
+        find_withdraw_authority_program_address(&program_id, stake_pool_address).0;
 
     let pool_token_account = pool_token_account.unwrap_or(get_associated_token_address(
         &config.token_owner.pubkey(),
@@ -1450,7 +1503,7 @@ fn command_withdraw_stake(
             .ok_or(format!("Provided stake account is delegated to a vote account {} which does not exist in the stake pool", vote_account))?;
         let validator_seed = NonZeroU32::new(validator_stake_info.validator_seed_suffix.into());
         let (stake_account_address, _) = find_stake_program_address(
-            &spl_stake_pool::id(),
+            &program_id,
             &vote_account,
             stake_pool_address,
             validator_seed,
@@ -1486,7 +1539,7 @@ fn command_withdraw_stake(
         ))?;
         let validator_seed = NonZeroU32::new(validator_stake_info.validator_seed_suffix.into());
         let (stake_account_address, _) = find_stake_program_address(
-            &spl_stake_pool::id(),
+            &program_id,
             vote_account_address,
             stake_pool_address,
             validator_seed,
@@ -1518,6 +1571,7 @@ fn command_withdraw_stake(
         // Get the list of accounts to withdraw from
         prepare_withdraw_accounts(
             &config.rpc_client,
+            &program_id,
             &stake_pool,
             pool_amount,
             stake_pool_address,
@@ -1588,7 +1642,7 @@ fn command_withdraw_stake(
             };
 
         instructions.push(spl_stake_pool::instruction::withdraw_stake(
-            &spl_stake_pool::id(),
+            &program_id,
             stake_pool_address,
             &stake_pool.validator_list,
             &pool_withdraw_authority,
@@ -1645,7 +1699,7 @@ fn command_withdraw_sol(
         command_update(config, stake_pool_address, false, false, false)?;
     }
 
-    let stake_pool = get_stake_pool(&config.rpc_client, stake_pool_address)?;
+    let (program_id, stake_pool) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
     let pool_mint = get_token_mint(&config.rpc_client, &stake_pool.pool_mint)?;
     let pool_amount = spl_token::ui_amount_to_amount(pool_amount, pool_mint.decimals);
 
@@ -1690,7 +1744,7 @@ fn command_withdraw_sol(
     ];
 
     let pool_withdraw_authority =
-        find_withdraw_authority_program_address(&spl_stake_pool::id(), stake_pool_address).0;
+        find_withdraw_authority_program_address(&program_id, stake_pool_address).0;
 
     let withdraw_instruction = if let Some(withdraw_authority) = config.funding_authority.as_ref() {
         let expected_sol_withdraw_authority =
@@ -1708,7 +1762,7 @@ fn command_withdraw_sol(
         }
 
         spl_stake_pool::instruction::withdraw_sol_with_authority(
-            &spl_stake_pool::id(),
+            &program_id,
             stake_pool_address,
             &withdraw_authority.pubkey(),
             &pool_withdraw_authority,
@@ -1723,7 +1777,7 @@ fn command_withdraw_sol(
         )
     } else {
         spl_stake_pool::instruction::withdraw_sol(
-            &spl_stake_pool::id(),
+            &program_id,
             stake_pool_address,
             &pool_withdraw_authority,
             &user_transfer_authority.pubkey(),
@@ -1761,7 +1815,7 @@ fn command_set_manager(
     if !config.no_update {
         command_update(config, stake_pool_address, false, false, false)?;
     }
-    let stake_pool = get_stake_pool(&config.rpc_client, stake_pool_address)?;
+    let (program_id, stake_pool) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
 
     // If new accounts are missing in the arguments use the old ones
     let (new_manager_pubkey, mut signers): (Pubkey, Vec<&dyn Signer>) = match new_manager {
@@ -1793,7 +1847,7 @@ fn command_set_manager(
     let transaction = checked_transaction_with_signers(
         config,
         &[spl_stake_pool::instruction::set_manager(
-            &spl_stake_pool::id(),
+            &program_id,
             stake_pool_address,
             &config.manager.pubkey(),
             &new_manager_pubkey,
@@ -1813,12 +1867,13 @@ fn command_set_staker(
     if !config.no_update {
         command_update(config, stake_pool_address, false, false, false)?;
     }
+    let (program_id, _) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
     let mut signers = vec![config.fee_payer.as_ref(), config.manager.as_ref()];
     unique_signers!(signers);
     let transaction = checked_transaction_with_signers(
         config,
         &[spl_stake_pool::instruction::set_staker(
-            &spl_stake_pool::id(),
+            &program_id,
             stake_pool_address,
             &config.manager.pubkey(),
             new_staker,
@@ -1838,12 +1893,13 @@ fn command_set_funding_authority(
     if !config.no_update {
         command_update(config, stake_pool_address, false, false, false)?;
     }
+    let (program_id, _) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
     let mut signers = vec![config.fee_payer.as_ref(), config.manager.as_ref()];
     unique_signers!(signers);
     let transaction = checked_transaction_with_signers(
         config,
         &[spl_stake_pool::instruction::set_funding_authority(
-            &spl_stake_pool::id(),
+            &program_id,
             stake_pool_address,
             &config.manager.pubkey(),
             new_authority.as_ref(),
@@ -1863,12 +1919,13 @@ fn command_set_fee(
     if !config.no_update {
         command_update(config, stake_pool_address, false, false, false)?;
     }
+    let (program_id, _) = get_stake_pool(&config.rpc_client, stake_pool_address)?;
     let mut signers = vec![config.fee_payer.as_ref(), config.manager.as_ref()];
     unique_signers!(signers);
     let transaction = checked_transaction_with_signers(
         config,
         &[spl_stake_pool::instruction::set_fee(
-            &spl_stake_pool::id(),
+            &program_id,
             stake_pool_address,
             &config.manager.pubkey(),
             new_fee,
